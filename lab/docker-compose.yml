@@ -1,0 +1,28 @@
+name: cve-2026-109618
+
+services:
+  vuln:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        PHP_IMAGE: php:8.4.26-apache
+    image: cve-2026-109618-vuln:8.4.26-apache
+    pull_policy: missing
+    init: true
+    restart: "no"
+    ports:
+      - "127.0.0.1:18220:80"
+
+  patched:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        PHP_IMAGE: php:8.4.27-apache
+    image: cve-2026-109618-patched:8.4.27-apache
+    pull_policy: missing
+    init: true
+    restart: "no"
+    ports:
+      - "127.0.0.1:18221:80"
