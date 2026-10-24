@@ -2,7 +2,7 @@
   <img src="header.png" alt="Abraxas Labs - php-oom-longjmp" width="100%">
 </p>
 
-# php-oom-longjmp
+# php2shell - php-oom-longjmp
 
 Someone on the internet can talk to your PHP site the same way a browser does, with no password. On last-affected PHP they can send a crafted file-upload request that makes the engine run out of memory while it is still reading the request, before your application starts. PHP then jumps out of that work with the request only half built. The PHP Group showed that cleanup of that half-built state can become remote code execution as the web worker. This lab proves the out-of-memory jump on Apache mod_php 8.4.26 and that 8.4.27 finishes the same request cleanly.
 
